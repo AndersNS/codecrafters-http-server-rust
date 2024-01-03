@@ -177,8 +177,10 @@ fn main() {
     for stream in listener.incoming() {
         match stream {
             Ok(mut stream) => {
-                println!("accepted new connection");
-                handle_stream(&mut stream);
+                std::thread::spawn(move || {
+                    println!("accepted new connection");
+                    handle_stream(&mut stream);
+                });
             }
             Err(e) => {
                 println!("error: {}", e);
