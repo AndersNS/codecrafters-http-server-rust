@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 // Uncomment this block to pass the first stage
 use std::fmt::{self, format, Debug, Display};
 use std::{
@@ -11,6 +12,7 @@ struct HttpRequest {
     method: String,
     path: String,
     version: String,
+    headers: HashMap<String, String>,
 }
 
 const LINE_ENDING: &str = "\r\n";
@@ -35,10 +37,22 @@ impl FromStr for HttpRequest {
             )
         };
 
+        let mut headers: HashMap<String, String> = HashMap::new();
+        for line in lines {
+            println!("{}", line);
+            if let Some((header, value)) = line.split_once(':') {
+                headers.insert(
+                    header.trim().to_lowercase().to_string(),
+                    value.trim().to_string(),
+                );
+            }
+        }
+
         Ok(Self {
             method,
             path,
             version,
+            headers,
         })
     }
 }
@@ -57,12 +71,22 @@ fn handle_stream(stream: &mut TcpStream) {
             match path {
                 "" => {
                     if let Some(path2) = paths.next() {
-                        if path2 == "echo" {
-                            ok_with_text_content(stream, paths.collect_vec().join("/").as_str());
-                        } else if path2.is_empty() {
-                            empty_ok(stream);
-                        } else {
-                            not_found(stream);
+                        match path2 {
+                            "echo" => {
+                                let content = paths.collect_vec().join("/");
+                                ok_with_text_content(stream, content.as_str());
+                            }
+                            "user-agent" => {
+                                let content = req.headers.get("user-agent").unwrap();
+                                ok_with_text_content(stream, content.as_str());
+                            }
+                            "" => {
+                                empty_ok(stream);
+                            }
+                            _ => {
+                                println!("not found {}", path);
+                                not_found(stream);
+                            }
                         }
                     } else {
                         not_found(stream);
