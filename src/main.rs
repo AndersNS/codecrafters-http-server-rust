@@ -1,18 +1,56 @@
 use itertools::Itertools;
 use std::collections::HashMap;
 use std::env;
+use std::io::{BufRead, BufReader};
 use std::{
     fmt::{self},
-    io::{Read, Write},
+    io::Write,
     net::{TcpListener, TcpStream},
     str::FromStr,
 };
 
+#[derive(Debug)]
+enum HttpStatusCode {
+    Ok,
+    NotFound = 404,
+    NoContent = 201,
+    InternalServerError = 500,
+}
+
+impl fmt::Display for HttpStatusCode {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            HttpStatusCode::Ok => write!(f, "200 OK"),
+            HttpStatusCode::NotFound => write!(f, "404 NOT FOUND"),
+            HttpStatusCode::NoContent => write!(f, "201 NO CONTENT"),
+            HttpStatusCode::InternalServerError => write!(f, "500 INTERNAL SERVER ERROR"),
+        }
+    }
+}
+
+#[derive(Debug)]
+enum HttpMethod {
+    Get,
+    Post,
+}
+
+impl FromStr for HttpMethod {
+    type Err = anyhow::Error;
+    fn from_str(s: &str) -> Result<Self, anyhow::Error> {
+        match s {
+            "GET" => Ok(Self::Get),
+            "POST" => Ok(Self::Post),
+            _ => Err(anyhow::anyhow!("Invalid HTTP method")),
+        }
+    }
+}
+
 struct HttpRequest {
-    method: String,
+    method: HttpMethod,
     path: String,
     version: String,
     headers: HashMap<String, String>,
+    body: String,
 }
 
 const LINE_ENDING: &str = "\r\n";
@@ -26,19 +64,27 @@ impl FromStr for HttpRequest {
         let (method, path, version) = {
             let mut parts = first_line.split_whitespace();
             (
-                parts.next().unwrap().to_string(),
+                parts
+                    .next()
+                    .unwrap()
+                    .to_string()
+                    .parse::<HttpMethod>()
+                    .unwrap(),
                 parts.next().unwrap().to_string(),
                 parts.next().unwrap().to_string(),
             )
         };
 
         let mut headers: HashMap<String, String> = HashMap::new();
+        let mut body = String::new();
         for line in lines {
             if let Some((header, value)) = line.split_once(':') {
                 headers.insert(
                     header.trim().to_lowercase().to_string(),
                     value.trim().to_string(),
                 );
+            } else if matches!(method, HttpMethod::Post) && !line.is_empty() {
+                body.push_str(line);
             }
         }
 
@@ -47,18 +93,40 @@ impl FromStr for HttpRequest {
             path,
             version,
             headers,
+            body,
         })
     }
 }
 
-fn handle_stream(stream: &mut TcpStream) {
-    let mut buffer = [0; 1024];
-    let res = stream.read(&mut buffer);
-    let str = String::from_utf8_lossy(&buffer);
+fn main() {
+    println!("Listening on port: 4221");
+
+    let listener = TcpListener::bind("127.0.0.1:4221").unwrap();
+
+    for stream in listener.incoming() {
+        match stream {
+            Ok(mut stream) => {
+                std::thread::spawn(move || {
+                    println!("New connection");
+                    handle_stream(&mut stream);
+                });
+            }
+            Err(e) => {
+                println!("error: {}", e);
+            }
+        }
+    }
+}
+
+fn handle_stream(mut stream: &mut TcpStream) {
+    let mut buf_reader = BufReader::new(&mut stream);
+    let buffer = buf_reader.fill_buf().unwrap();
+    let str = String::from_utf8(buffer.to_vec()).unwrap();
+
     if let Ok(req) = str.parse::<HttpRequest>() {
         println!(
-            "Request: {}, path: {}, version: {}",
-            req.method, req.path, req.version
+            "Request: {:?}, path: {}, version: {}, body: {}",
+            req.method, req.path, req.version, req.body
         );
         let mut paths = req.path.split('/');
         if let Some(path) = paths.next() {
@@ -76,14 +144,17 @@ fn handle_stream(stream: &mut TcpStream) {
                             }
                             "files" => {
                                 let filename = paths.collect_vec().join("/");
-                                if let Some(content) = get_file_content(filename.as_str()) {
+                                if matches!(req.method, HttpMethod::Post) {
+                                    save_file(filename.as_str(), req.body.as_str());
+                                    no_content(stream);
+                                } else if let Some(content) = get_file_content(filename.as_str()) {
                                     ok_with_octet_stream(stream, content.as_str());
                                 } else {
                                     not_found(stream);
                                 }
                             }
                             "" => {
-                                empty_ok(stream);
+                                ok(stream);
                             }
                             _ => {
                                 println!("not found {}", path);
@@ -101,7 +172,8 @@ fn handle_stream(stream: &mut TcpStream) {
             }
         }
     } else {
-        println!("error: {:?}", res);
+        println!("Could not parse request: {:?}", str);
+        internal_error(stream);
     }
 }
 
@@ -120,38 +192,36 @@ fn not_found(stream: &mut TcpStream) {
     send_response(stream, response.as_str())
 }
 
-fn empty_ok(stream: &mut TcpStream) {
+fn ok(stream: &mut TcpStream) {
     let response = create_response(HttpStatusCode::Ok, "", "");
     send_response(stream, response.as_str())
 }
 
-fn get_file_content(filename: &str) -> Option<String> {
+fn no_content(stream: &mut TcpStream) {
+    let response = create_response(HttpStatusCode::NoContent, "", "");
+    send_response(stream, response.as_str())
+}
+
+fn internal_error(stream: &mut TcpStream) {
+    let response = create_response(HttpStatusCode::InternalServerError, "", "");
+    send_response(stream, response.as_str())
+}
+
+fn get_file_path(filename: &str) -> String {
     let cmd_args: Vec<String> = env::args().collect();
     let directory_path = &cmd_args[2];
+    format!("{}/{}", directory_path, filename)
+}
 
-    if let Ok(contents) = std::fs::read_to_string(format!("{}/{}", directory_path, filename)) {
+fn save_file(file_name: &str, file_contents: &str) {
+    std::fs::write(get_file_path(file_name), file_contents).unwrap();
+}
+
+fn get_file_content(filename: &str) -> Option<String> {
+    if let Ok(contents) = std::fs::read_to_string(get_file_path(filename)) {
         Some(contents)
     } else {
         None
-    }
-}
-
-#[derive(Debug)]
-enum HttpStatusCode {
-    Ok,
-    NotFound = 404,
-}
-
-impl fmt::Display for HttpStatusCode {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match self {
-            HttpStatusCode::Ok => {
-                write!(f, "200 OK")
-            }
-            HttpStatusCode::NotFound => {
-                write!(f, "404 NOT FOUND")
-            }
-        }
     }
 }
 
@@ -175,24 +245,4 @@ fn create_response(status_code: HttpStatusCode, content_type: &str, content: &st
 fn send_response(stream: &mut TcpStream, response: &str) {
     stream.write_all(response.as_bytes()).unwrap();
     stream.flush().unwrap();
-}
-
-fn main() {
-    println!("Listening on port: 4221");
-
-    let listener = TcpListener::bind("127.0.0.1:4221").unwrap();
-
-    for stream in listener.incoming() {
-        match stream {
-            Ok(mut stream) => {
-                std::thread::spawn(move || {
-                    println!("New connection");
-                    handle_stream(&mut stream);
-                });
-            }
-            Err(e) => {
-                println!("error: {}", e);
-            }
-        }
-    }
 }
