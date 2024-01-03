@@ -1,13 +1,13 @@
+use itertools::Itertools;
 use std::collections::HashMap;
-// Uncomment this block to pass the first stage
-use std::fmt::{self, format, Debug, Display};
+use std::env;
 use std::{
+    fmt::{self},
     io::{Read, Write},
     net::{TcpListener, TcpStream},
     str::FromStr,
 };
 
-use itertools::Itertools;
 struct HttpRequest {
     method: String,
     path: String,
@@ -17,11 +17,6 @@ struct HttpRequest {
 
 const LINE_ENDING: &str = "\r\n";
 
-/*
-GET /index.html HTTP/1.1
-Host: localhost:4221
-User-Agent: curl/7.64.1
-*/
 impl FromStr for HttpRequest {
     type Err = anyhow::Error;
 
@@ -39,7 +34,6 @@ impl FromStr for HttpRequest {
 
         let mut headers: HashMap<String, String> = HashMap::new();
         for line in lines {
-            println!("{}", line);
             if let Some((header, value)) = line.split_once(':') {
                 headers.insert(
                     header.trim().to_lowercase().to_string(),
@@ -80,6 +74,14 @@ fn handle_stream(stream: &mut TcpStream) {
                                 let content = req.headers.get("user-agent").unwrap();
                                 ok_with_text_content(stream, content.as_str());
                             }
+                            "files" => {
+                                let filename = paths.collect_vec().join("/");
+                                if let Some(content) = get_file_content(filename.as_str()) {
+                                    ok_with_octet_stream(stream, content.as_str());
+                                } else {
+                                    not_found(stream);
+                                }
+                            }
                             "" => {
                                 empty_ok(stream);
                             }
@@ -103,6 +105,11 @@ fn handle_stream(stream: &mut TcpStream) {
     }
 }
 
+fn ok_with_octet_stream(stream: &mut TcpStream, content: &str) {
+    let response = create_response(HttpStatusCode::Ok, "application/octet-stream", content);
+    send_response(stream, response.as_str())
+}
+
 fn ok_with_text_content(stream: &mut TcpStream, content: &str) {
     let response = create_response(HttpStatusCode::Ok, "text/plain", content);
     send_response(stream, response.as_str())
@@ -116,6 +123,17 @@ fn not_found(stream: &mut TcpStream) {
 fn empty_ok(stream: &mut TcpStream) {
     let response = create_response(HttpStatusCode::Ok, "", "");
     send_response(stream, response.as_str())
+}
+
+fn get_file_content(filename: &str) -> Option<String> {
+    let cmd_args: Vec<String> = env::args().collect();
+    let directory_path = &cmd_args[2];
+
+    if let Ok(contents) = std::fs::read_to_string(format!("{}/{}", directory_path, filename)) {
+        Some(contents)
+    } else {
+        None
+    }
 }
 
 #[derive(Debug)]
@@ -137,13 +155,6 @@ impl fmt::Display for HttpStatusCode {
     }
 }
 
-/*
-HTTP/1.1 200 OK
-Content-Type: text/plain
-Content-Length: 3
-
-abc
-*/
 fn create_response(status_code: HttpStatusCode, content_type: &str, content: &str) -> String {
     let mut response = String::from("");
     response.push_str("HTTP/1.1 ");
@@ -167,10 +178,7 @@ fn send_response(stream: &mut TcpStream, response: &str) {
 }
 
 fn main() {
-    // You can use print statements as follows for debugging, they'll be visible when running tests.
-    println!("Logs from your program will appear here!");
-
-    // Uncomment this block to pass the first stage
+    println!("Listening on port: 4221");
 
     let listener = TcpListener::bind("127.0.0.1:4221").unwrap();
 
@@ -178,7 +186,7 @@ fn main() {
         match stream {
             Ok(mut stream) => {
                 std::thread::spawn(move || {
-                    println!("accepted new connection");
+                    println!("New connection");
                     handle_stream(&mut stream);
                 });
             }
