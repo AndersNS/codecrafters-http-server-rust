@@ -1,15 +1,19 @@
 // Uncomment this block to pass the first stage
+use std::fmt::{self, format, Debug, Display};
 use std::{
     io::{Read, Write},
     net::{TcpListener, TcpStream},
     str::FromStr,
 };
 
+use itertools::Itertools;
 struct HttpRequest {
     method: String,
     path: String,
     version: String,
 }
+
+const LINE_ENDING: &str = "\r\n";
 
 /*
 GET /index.html HTTP/1.1
@@ -17,9 +21,9 @@ Host: localhost:4221
 User-Agent: curl/7.64.1
 */
 impl FromStr for HttpRequest {
-    type Err = String;
+    type Err = anyhow::Error;
 
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
+    fn from_str(s: &str) -> Result<Self, anyhow::Error> {
         let mut lines = s.lines();
         let first_line = lines.next().unwrap();
         let (method, path, version) = {
@@ -45,26 +49,97 @@ fn handle_stream(stream: &mut TcpStream) {
     let str = String::from_utf8_lossy(&buffer);
     if let Ok(req) = str.parse::<HttpRequest>() {
         println!(
-            "method: {}, path: {}, version: {}",
+            "Request: {}, path: {}, version: {}",
             req.method, req.path, req.version
         );
-        match req.path.as_str() {
-            "/" => {
-                stream
-                    .write_all("HTTP/1.1 200 OK \r\n\r\n".as_bytes())
-                    .unwrap();
-                stream.flush().unwrap();
-            }
-            _ => {
-                stream
-                    .write_all("HTTP/1.1 404 NOT FOUND \r\n\r\n".as_bytes())
-                    .unwrap();
-                stream.flush().unwrap();
+        let mut paths = req.path.split('/');
+        if let Some(path) = paths.next() {
+            match path {
+                "" => {
+                    if let Some(path2) = paths.next() {
+                        if path2 == "echo" {
+                            ok_with_text_content(stream, paths.collect_vec().join("/").as_str());
+                        } else if path2.is_empty() {
+                            empty_ok(stream);
+                        } else {
+                            not_found(stream);
+                        }
+                    } else {
+                        not_found(stream);
+                    }
+                }
+                _ => {
+                    println!("not found {}", path);
+                    not_found(stream);
+                }
             }
         }
     } else {
         println!("error: {:?}", res);
     }
+}
+
+fn ok_with_text_content(stream: &mut TcpStream, content: &str) {
+    let response = create_response(HttpStatusCode::Ok, "text/plain", content);
+    send_response(stream, response.as_str())
+}
+
+fn not_found(stream: &mut TcpStream) {
+    let response = create_response(HttpStatusCode::NotFound, "", "");
+    send_response(stream, response.as_str())
+}
+
+fn empty_ok(stream: &mut TcpStream) {
+    let response = create_response(HttpStatusCode::Ok, "", "");
+    send_response(stream, response.as_str())
+}
+
+#[derive(Debug)]
+enum HttpStatusCode {
+    Ok,
+    NotFound = 404,
+}
+
+impl fmt::Display for HttpStatusCode {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            HttpStatusCode::Ok => {
+                write!(f, "200 OK")
+            }
+            HttpStatusCode::NotFound => {
+                write!(f, "404 NOT FOUND")
+            }
+        }
+    }
+}
+
+/*
+HTTP/1.1 200 OK
+Content-Type: text/plain
+Content-Length: 3
+
+abc
+*/
+fn create_response(status_code: HttpStatusCode, content_type: &str, content: &str) -> String {
+    let mut response = String::from("");
+    response.push_str("HTTP/1.1 ");
+    response.push_str(format!("{}{}", status_code, LINE_ENDING).as_str());
+    if !content.is_empty() {
+        response.push_str(format!("Content-Type: {}{}", content_type, LINE_ENDING).as_str());
+        response.push_str(format!("Content-Length: {}{}", content.len(), LINE_ENDING).as_str());
+        response.push_str(LINE_ENDING);
+        response.push_str(content);
+    } else {
+        response.push_str(LINE_ENDING);
+        response.push_str(LINE_ENDING);
+    }
+
+    response
+}
+
+fn send_response(stream: &mut TcpStream, response: &str) {
+    stream.write_all(response.as_bytes()).unwrap();
+    stream.flush().unwrap();
 }
 
 fn main() {
